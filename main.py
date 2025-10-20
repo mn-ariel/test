@@ -1,95 +1,97 @@
-v# core/muestreo_homogeneo.py
+# main.py
+from __future__ import annotations
 import logging
-from typing import Any, Dict, Sequence, Tuple, Optional
+from logging.config import dictConfig
 import pandas as pd
-from core.evaluadores import (
-    generar_muestras_y_evaluar,
-    analizar_datos_por_grupo,
-)
-from services.sizes import NormalApproxSize
 
-logger = logging.getLogger(__name__)
+from factories import MuestreoFactory, MuestreoConfig  # tu factory mejorada
 
-class MuestreoHomogeneidad:
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        identificador_df: str,
-        variables_control_continuas: Sequence[str],
-        variables_control_categoricas: Optional[Sequence[str]],
-        sup_proporcion: float,
-        nivel_confianza: float,
-        error_relativo: float,
-        proporciones_esperadas: Tuple[float, float],
-        semillas_aleatorias: Sequence[int],
-        umbral_homogeneidad: float,
-        margen_muestra_extra: float,
-        size_calc: Optional[NormalApproxSize] = None,
-    ) -> None:
-        self.df = df
-        self.ident = identificador_df
-        self.ind_cont = list(variables_control_continuas)
-        self.ind_cat = list(variables_control_categoricas or [])
-        self.p = sup_proporcion
-        self.z = nivel_confianza
-        self.e = error_relativo
-        self.proporciones = proporciones_esperadas
-        self.seeds = list(semillas_aleatorias)
-        self.threshold = umbral_homogeneidad
-        self.m_extra = margen_muestra_extra
-        self.size_calc = size_calc or NormalApproxSize()
-        self.estado = "OK"
-        self.errores: list[str] = []
-        self._resultado: Dict[str, Any] = {}
+def setup_logging() -> None:
+    dictConfig({
+        "version": 1,
+        "formatters": {"std": {"format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"}},
+        "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "std", "level": "INFO"}},
+        "root": {"level": "INFO", "handlers": ["console"]},
+    })
 
-    def run(self) -> Dict[str, Any]:
-        try:
-            n_total = len(self.df)
-            n_inf = self.size_calc.sample_size_infinite(self.p, self.z, self.e)
-            n_fin = self.size_calc.sample_size_finite(n_total, self.p, self.z, self.e)
-            n_ajustada = int(n_fin * (1 + self.m_extra))
+def run_pipeline(df: pd.DataFrame) -> dict:
+    setup_logging()
 
-            resumen_control = analizar_datos_por_grupo(
-                self.df, self.ind_cont, self.ind_cat
-            )
+    cfg = MuestreoConfig(
+        df=df,
+        identificador_df="folio",
+        variables_control_continuas=["peso", "volumen"],
+        variables_control_categoricas=["origen", "destino"],
+        sup_proporcion=0.5,
+        nivel_confianza=1.96,
+        error_relativo=0.05,
+        margen_muestra_extra=0.10,
+        seed_global=42,
+        cantidad_semillas=5,
+    )
 
-            resultado, estado, errores, df_piloto, df_control = generar_muestras_y_evaluar(
-                df=self.df,
-                ident=self.ident,
-                ind_cont=self.ind_cont,
-                ind_cat=self.ind_cat,
-                muestra_minima_extra=n_ajustada,
-                proporciones=self.proporciones,
-                seeds=self.seeds,
-                p_threshold=self.threshold,
-            )
+    muestreo = MuestreoFactory.crear_muestreo_homogeneo(cfg)
 
-            self.estado = estado
-            self.errores.extend(errores)
+    logger = logging.getLogger("pipeline")
 
-            self._resultado = {
-                "tamano_infinita": n_inf,
-                "tamano_finita": n_fin,
-                "tamano_ajustada": n_ajustada,
-                "resumen_variables_control": resumen_control,
-                "resultado_mejor_grupo": resultado,
-                "df_piloto": df_piloto,
-                "df_control": df_control,
-                "seed_utilizada": resultado.get("mejor_semilla") if resultado else None,
-            }
-            return self._resultado
-        except Exception as exc:
-            self.estado = "ERROR"
-            self.errores.append(str(exc))
-            logger.exception("Error en run()")
-            return {}
+    # --- 1) tamaños de muestra
+    muestreo.tamano_muestra_infinita, muestreo.calculo_muestra_infinita = \
+        muestreo.calcular_tamano_muestra_poblacion_infinita(
+            muestreo._p, muestreo._nc, muestreo._e_pct
+        )
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = dict(self._resultado)
-        if "df_piloto" in d:
-            d["df_piloto"] = None  # exporta con Exporter, no aquí
-        if "df_control" in d:
-            d["df_control"] = None
-        d["estado"] = self.estado
-        d["errores"] = list(self.errores)
-        return d
+    muestreo.tamano_muestra_finita, muestreo.calculo_muestra_finita, muestreo.tamano_muestra_finita_ajustada = \
+        muestreo.calcular_tamano_muestra_poblacion_finita(
+            muestreo._df, muestreo._p, muestreo._nc, muestreo._e_pct, muestreo._m_m_x
+        )
+
+    # --- 2) generar y evaluar muestras
+    (
+        muestreo.resultado_mejor_grupo_homogeneo,
+        estado_generacion,
+        errores_generacion,
+        muestreo.df_piloto,
+        muestreo.df_control,
+    ) = muestreo.generar_muestras_y_evaluar(
+        df=muestreo._df,
+        ident=muestreo._ident,
+        ind_cont=muestreo._ind_cont,
+        ind_cat=muestreo._ind_cat,
+        muestra_minima_extra=muestreo.tamano_muestra_finita_ajustada,
+        proporciones=muestreo._proportions,
+        seeds=muestreo._seeds,
+        p_threshold=muestreo._p_threshold,
+        evaluar_variables_continuas=muestreo.evaluar_variables_continuas,   # si tus firmas lo requieren
+        evaluar_variables_categoricas=muestreo.evaluar_variables_categoricas,
+        seleccionar_mejor_grupo_homogeneo=muestreo.seleccionar_mejor_grupo_homogeneo
+    )
+
+    if estado_generacion == "ERROR":
+        muestreo.estado = "ERROR"
+        muestreo.errores.extend(errores_generacion)
+        # si quieres abortar:
+        raise RuntimeError(f"Error en generación de muestras: {errores_generacion}")
+
+    # --- 3) post-proceso: mejor semilla
+    if muestreo.resultado_mejor_grupo_homogeneo is not None:
+        muestreo.mejor_semilla = muestreo.resultado_mejor_grupo_homogeneo.get("mejor_semilla")
+
+    # --- 4) resumen de variables por grupo
+    muestreo.resumen_variables_control = muestreo.analizar_datos_por_grupo(
+        muestreo.df_piloto, muestreo.df_control, muestreo._ind_cont, muestreo._ind_cat
+    )
+
+    # --- 5) preparar resultados y guardar
+    datos = muestreo.preparar_datos_resultado()
+    muestreo.guardar_resultados_json("outputs/resultados.json")
+
+    logger.info("Pipeline OK | tam_f=%s tam_f_adj=%s semilla=%s",
+                muestreo.tamano_muestra_finita,
+                muestreo.tamano_muestra_finita_ajustada,
+                getattr(muestreo, "mejor_semilla", None))
+    return datos
+
+if __name__ == "__main__":
+    # Carga tu DF real aquí
+    df_demo = pd.DataFrame({"folio": [1,2,3], "peso":[10,12,9], "volumen":[1,1.2,0.9], "origen":["A","A","B"], "destino":["X","X","Y"]})
+    run_pipeline(df_demo)
