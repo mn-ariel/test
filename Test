@@ -1,0 +1,546 @@
+# ======================================================================
+# AB Testing - Homogeneous Sampling in PySpark (Notebook-friendly, no patterns)
+# Sections:
+#   1) Spark + logging setup
+#   2) Sample-size helpers (infinite / finite population)
+#   3) Parameter validation
+#   4) Group generation and homogeneity evaluation
+#   5) Per-group summaries (continuous & categorical)
+#   6) Orchestrator: run_muestreo_homogeneidad(...)
+#   7) (Optional) Example usage
+# Notes:
+# - Uses logging (no print).
+# - SciPy runs on driver for statistical tests; Spark does splitting/aggregation.
+# ======================================================================
+
+# === 1) Spark + logging setup =========================================
+from pyspark.sql import SparkSession, DataFrame as SparkDF
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, rand
+
+import numpy as np
+from scipy import stats
+from math import ceil
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Any, List
+import json, os, logging, random
+
+spark = SparkSession.builder.getOrCreate()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("ab_testing_pyspark")
+
+# === 2) Sample-size helpers ===========================================
+
+def calcular_tamano_muestra_poblacion_infinita(
+    p: float, nc: float, e_pct: float
+) -> Tuple[int, str]:
+    """Return n_infinite, derivation string."""
+    Z = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}.get(round(float(nc), 2), 1.96)
+    q = 1 - p
+    e = e_pct
+    n = (Z**2 * p * q) / (e**2)
+    n_int = int(ceil(n))
+    deriv = f"n=(Z^2*p*q)/e^2; Z={Z}, p={p}, q={q}, e={e}"
+    return n_int, deriv
+
+
+def calcular_tamano_muestra_poblacion_finita(
+    N_total_ids: int, p: float, nc: float, e_pct: float, m_m_x: float
+) -> Tuple[int, str, int]:
+    """Return n_finite, derivation, n_finite_adjusted (extra margin)."""
+    n_inf, deriv_inf = calcular_tamano_muestra_poblacion_infinita(p, nc, e_pct)
+    N = max(int(N_total_ids), 1)
+    n_fin = int(ceil((N * n_inf) / (n_inf + N - 1)))
+    n_fin_adj = int(ceil(n_fin * (1 + m_m_x)))
+    deriv = f"{deriv_inf}; finite_correction: N={N} -> n={n_fin}; margin_extra={m_m_x} -> n_adj={n_fin_adj}"
+    return n_fin, deriv, n_fin_adj
+
+# === 3) Parameter validation ==========================================
+
+def validar_parametros(
+    df: SparkDF,
+    ident: str,
+    ind_cont: List[str],
+    ind_cat: Optional[List[str]],
+    p: float,
+    nc: float,
+    e_pct: float,
+    proportions: Tuple[float, float],
+    p_threshold: float,
+    m_m_x: float,
+    seeds: Optional[List[int]],
+) -> List[str]:
+    errors: List[str] = []
+
+    if df is None:
+        errors.append("df must be a Spark DataFrame.")
+    else:
+        if ident not in df.columns:
+            errors.append(f"Identifier column '{ident}' not found in DataFrame.")
+
+    if not isinstance(ind_cont, list):
+        errors.append("ind_cont must be a list.")
+    if ind_cat is not None and not isinstance(ind_cat, list):
+        errors.append("ind_cat must be a list or None.")
+
+    for name, val in [("p", p), ("nc", nc), ("e_pct", e_pct), ("p_threshold", p_threshold)]:
+        if not isinstance(val, (int, float)):
+            errors.append(f"{name} must be numeric.")
+        elif not (0 <= float(val) <= 1):
+            errors.append(f"{name} must be in [0,1]. Got: {val}")
+
+    if not isinstance(proportions, tuple) or len(proportions) != 2:
+        errors.append("proportions must be a tuple of two values.")
+    else:
+        if any((not isinstance(x, (int, float)) or x < 0) for x in proportions):
+            errors.append("proportions values must be non-negative numbers.")
+        elif abs(sum(proportions) - 1.0) > 1e-6:
+            errors.append(f"proportions must sum to 1. Got: {sum(proportions):.3f}")
+
+    if seeds is not None:
+        if not isinstance(seeds, list):
+            errors.append("seeds must be a list.")
+        elif any((not isinstance(s, int)) or s < 0 for s in seeds):
+            errors.append("All seeds must be positive integers.")
+
+    if not isinstance(m_m_x, (int, float)):
+        errors.append("m_m_x must be numeric in [0,1].")
+    elif not (0 <= float(m_m_x) <= 1):
+        errors.append(f"m_m_x must be in [0,1]. Got: {m_m_x}")
+
+    return errors
+
+# === 4) Group generation & homogeneity evaluation ======================
+
+def _init_log(seed: int) -> Dict[str, Any]:
+    return {
+        "mejor_semilla": seed,
+        "homogeneidad": None,
+        "estado": "",
+        "detalle_estado": {"mensaje": ""},
+        "resumen": {},
+        "ids": {},
+        "resultados_homogeneidad": {},
+    }
+
+
+def _generar_grupos(
+    df: SparkDF,
+    ident: str,
+    proportions: Tuple[float, float],
+    seed: int,
+    muestra_minima: int,
+    log: Dict[str, Any],
+) -> Tuple[List[Any], List[Any]]:
+    ids_df = df.select(ident).where(col(ident).isNotNull()).distinct()
+    n_ids = ids_df.count()
+    n1 = int(proportions[0] * n_ids)
+    n2 = int(proportions[1] * n_ids)
+
+    if n_ids < muestra_minima:
+        raise ValueError(f"Insufficient unique IDs: need {muestra_minima}, have {n_ids}.")
+    if n1 < muestra_minima or n2 < muestra_minima:
+        raise ValueError(f"Pilot (n1={n1})/Control (n2={n2}) below minimum {muestra_minima}.")
+    if (n1 + n2) > n_ids:
+        raise ValueError(f"n1+n2 exceeds available IDs ({n1+n2}>{n_ids}).")
+
+    ordered = ids_df.withColumn("_rand", rand(seed=seed)).orderBy("_rand").drop("_rand")
+    pilot_df = ordered.limit(n1)
+    # remaining via anti join (avoid re-collecting/duplicating)
+    remaining_df = ordered.join(pilot_df, on=ident, how="left_anti")
+    control_df = remaining_df.withColumn("_r2", rand(seed=seed + 1)).orderBy("_r2").drop("_r2").limit(n2)
+
+    ids_piloto = [r[0] for r in pilot_df.collect()]
+    ids_control = [r[0] for r in control_df.collect()]
+
+    log["resumen"] = {
+        "total_ids_unicos": n_ids,
+        "piloto": {"n": n1, "proporcion": proportions[0]},
+        "control": {"n": n2, "proporcion": proportions[1]},
+    }
+    log["ids"] = {"piloto": ids_piloto, "control": ids_control}
+    return ids_piloto, ids_control
+
+
+def _any_null_or_all_zero(df: SparkDF, colname: str) -> bool:
+    if df.where(F.col(colname).isNull()).limit(1).count() > 0:
+        return True
+    cnt = df.count()
+    if cnt == 0:
+        return True
+    zeros = df.where(F.col(colname) == 0).count()
+    return zeros == cnt
+
+
+def _contains_invalid(sample_1: SparkDF, sample_2: SparkDF, ind_cont: List[str], ind_cat: List[str]) -> bool:
+    cols = (ind_cont or []) + (ind_cat or [])
+    for c in cols:
+        if _any_null_or_all_zero(sample_1, c) or _any_null_or_all_zero(sample_2, c):
+            return True
+    return False
+
+
+def _col_to_numpy(df: SparkDF, colname: str) -> np.ndarray:
+    # collect only needed column values (drop nulls)
+    return np.array([r[0] for r in df.select(colname).where(F.col(colname).isNotNull()).toLocalIterator()])
+
+
+def evaluar_variables_continuas(
+    sample_1: SparkDF, sample_2: SparkDF, ind_cont: List[str], p_threshold: float
+) -> Tuple[Dict[str, Dict[str, Optional[float]]], bool]:
+    resultados = {"levene": {}, "mood": {}, "ttest": {}, "perc_median": {}}
+    homog = True
+
+    for colname in ind_cont or []:
+        s1 = _col_to_numpy(sample_1, colname)
+        s2 = _col_to_numpy(sample_2, colname)
+
+        if s1.size == 0 or s2.size == 0 or (s1 == 0).all() or (s2 == 0).all():
+            for k in resultados:
+                resultados[k][colname] = None
+            homog = False
+            continue
+
+        try:
+            resultados["levene"][colname] = float(stats.levene(s1, s2, center="median").pvalue)
+        except Exception:
+            resultados["levene"][colname] = None
+        try:
+            resultados["mood"][colname] = float(stats.median_test(s1, s2)[1])
+        except Exception:
+            resultados["mood"][colname] = None
+        try:
+            resultados["ttest"][colname] = float(stats.ttest_ind(s1, s2, equal_var=False).pvalue)
+        except Exception:
+            resultados["ttest"][colname] = None
+
+        try:
+            med1, med2 = np.median(s1), np.median(s2)
+            mmin = min(med1, med2)
+            resultados["perc_median"][colname] = float(abs(med1 - med2) / mmin) if mmin > 0 else None
+        except Exception:
+            resultados["perc_median"][colname] = None
+
+        for test in ("levene", "mood", "ttest"):
+            p = resultados[test][colname]
+            if p is not None and p < p_threshold:
+                homog = False
+                break
+
+    return resultados, homog
+
+
+def evaluar_variables_categoricas(
+    sample_1: SparkDF, sample_2: SparkDF, ind_cat: List[str], p_threshold: float
+) -> Tuple[Dict[str, Dict[str, Optional[float]]], bool]:
+    resultados = {"chisquare": {}}
+    homog = True
+
+    for colname in ind_cat or []:
+        s1 = sample_1.select(colname).where(F.col(colname).isNotNull())
+        s2 = sample_2.select(colname).where(F.col(colname).isNotNull())
+        if s1.rdd.isEmpty() or s2.rdd.isEmpty():
+            resultados["chisquare"][colname] = None
+            homog = False
+            continue
+
+        cats = [r[0] for r in s1.distinct().union(s2.distinct()).collect()]
+        c1 = {r[0]: r[1] for r in s1.groupBy(colname).count().collect()}
+        c2 = {r[0]: r[1] for r in s2.groupBy(colname).count().collect()}
+        contingency = np.vstack([[c1.get(cat, 0), c2.get(cat, 0)] for cat in cats]).T
+
+        if contingency.sum() == 0:
+            resultados["chisquare"][colname] = None
+            homog = False
+            continue
+
+        try:
+            chi2, p, dof, exp = stats.chi2_contingency(contingency, correction=False)
+            resultados["chisquare"][colname] = float(p)
+            if p < p_threshold:
+                homog = False
+        except Exception:
+            resultados["chisquare"][colname] = None
+            homog = False
+
+    return resultados, homog
+
+
+def _score_log(log: Dict[str, Any]) -> float:
+    res = log.get("resultados_homogeneidad", {})
+    perc = res.get("perc_median", {})
+    lev = res.get("levene", {})
+    mood = res.get("mood", {})
+    ttest = res.get("ttest", {})
+    chi = res.get("chisquare", {})
+    score = 0.0
+    for v in perc.values():
+        if v is not None:
+            score += v
+    for grp in (lev, mood, ttest, chi):
+        for p in grp.values():
+            if p is not None:
+                score += (1 - p)
+    return score
+
+
+def seleccionar_mejor_grupo_homogeneo(resultado_homogeneidad: Dict[int, Dict[str, Any]]) -> Tuple[Optional[int], List[str]]:
+    errors: List[str] = []
+    candidatos = {seed: log for seed, log in resultado_homogeneidad.items() if log.get("homogeneidad") and log.get("estado") == "OK"}
+    if not candidatos:
+        errors.append("No homogeneous group found with provided seeds.")
+        return None, errors
+    best_seed = min(candidatos.keys(), key=lambda s: _score_log(candidatos[s]))
+    return best_seed, errors
+
+
+def generar_muestras_y_evaluar(
+    df: SparkDF,
+    ident: str,
+    ind_cont: List[str],
+    ind_cat: List[str],
+    muestra_minima_extra: int,
+    proportions: Tuple[float, float],
+    seeds: List[int],
+    p_threshold: float,
+) -> Tuple[Optional[Dict[str, Any]], str, List[str], Optional[SparkDF], Optional[SparkDF]]:
+    resultado_h: Dict[int, Dict[str, Any]] = {}
+    estado = "OK"
+    errores: List[str] = []
+
+    for seed in seeds:
+        log = _init_log(seed)
+        try:
+            ids_g1, ids_g2 = _generar_grupos(df, ident, proportions, seed, muestra_minima_extra, log)
+            sample_1 = df.where(col(ident).isin(ids_g1))
+            sample_2 = df.where(col(ident).isin(ids_g2))
+
+            if _contains_invalid(sample_1, sample_2, ind_cont, ind_cat):
+                raise ValueError("Invalid data: nulls or all-zeros in key variables.")
+
+            res_cont, homog_cont = evaluar_variables_continuas(sample_1, sample_2, ind_cont, p_threshold)
+            res_cat, homog_cat = evaluar_variables_categoricas(sample_1, sample_2, ind_cat, p_threshold)
+            homog = homog_cont and homog_cat
+
+            log["estado"] = "OK"
+            log["resultados_homogeneidad"] = {**res_cont, **res_cat}
+            log["homogeneidad"] = homog
+            log["detalle_estado"]["mensaje"] = "Evaluation completed."
+            resultado_h[seed] = log
+
+        except Exception as e:
+            estado = "ERROR"
+            msg = f"Seed {seed} failed: {str(e)}"
+            errores.append(msg)
+            log["estado"] = "ERROR"
+            log["detalle_estado"]["mensaje"] = msg
+            resultado_h[seed] = log
+            break
+
+    best_seed, sel_errors = seleccionar_mejor_grupo_homogeneo(resultado_h)
+    if best_seed is None:
+        errores.extend(sel_errors)
+        estado = "ERROR"
+        return None, estado, errores, None, None
+
+    best = resultado_h[best_seed]
+    ids_piloto, ids_control = best["ids"]["piloto"], best["ids"]["control"]
+    df_piloto = df.where(col(ident).isin(ids_piloto))
+    df_control = df.where(col(ident).isin(ids_control))
+    return best, estado, errores, df_piloto, df_control
+
+# === 5) Per-group summaries ===========================================
+
+def analizar_datos_por_grupo(
+    df_piloto: SparkDF, df_control: SparkDF, ind_cont: List[str], ind_cat: List[str]
+) -> Dict[str, List[Dict[str, Any]]]:
+    resumen_continuas = []
+    for c in ind_cont or []:
+        m1 = df_piloto.select(F.mean(F.col(c))).first()[0]
+        m2 = df_control.select(F.mean(F.col(c))).first()[0]
+        resumen_continuas.append({
+            "Variable": c,
+            "PILOTO": round(float(m1 or 0), 2),
+            "CONTROL": round(float(m2 or 0), 2),
+        })
+
+    resumen_categoricas = []
+    for c in ind_cat or []:
+        tot1 = df_piloto.count()
+        tot2 = df_control.count()
+        cats = df_piloto.select(c).dropna().distinct().union(df_control.select(c).dropna().distinct())
+        for row in cats.collect():
+            cat = row[0]
+            c1 = df_piloto.where(F.col(c) == cat).count()
+            c2 = df_control.where(F.col(c) == cat).count()
+            p1 = round((c1 / tot1) * 100, 1) if tot1 > 0 else 0.0
+            p2 = round((c2 / tot2) * 100, 1) if tot2 > 0 else 0.0
+            resumen_categoricas.append({
+                "Variable": c,
+                "Categoría": cat,
+                "PILOTO": f"{c1} ({p1}%)",
+                "CONTROL": f"{c2} ({p2}%)",
+            })
+
+    return {
+        "Variables_Continuas": resumen_continuas,
+        "Variables_Categoricas": resumen_categoricas,
+    }
+
+# === 6) Orchestrator ===================================================
+
+@dataclass
+class ResultadosMuestreo:
+    estado: str
+    errores: List[str]
+    muestra_infinita: Optional[Dict[str, Any]]
+    muestra_finita: Optional[Dict[str, Any]]
+    mejor_semilla: Optional[int]
+    resultado_homogeneidad: Optional[Dict[str, Any]]
+    resumen_variables_control: Optional[Dict[str, Any]]
+    df_piloto: Optional[SparkDF]
+    df_control: Optional[SparkDF]
+
+
+def run_muestreo_homogeneidad(
+    df: SparkDF,
+    identificador_df: str,
+    variables_control_continuas: List[str],
+    variables_control_categoricas: Optional[List[str]],
+    sup_proporcion: float,
+    nivel_confianza: float,
+    error_relativo: float,
+    proporciones_esperadas: Tuple[float, float],
+    semillas_aleatorias: List[int],
+    umbral_homogeneidad: float,
+    margen_muestra_extra: float,
+    save_outputs: bool = True,
+) -> ResultadosMuestreo:
+    """Main entry for notebooks."""
+    estado = "OK"
+    errores: List[str] = []
+
+    # Validate
+    errs = validar_parametros(
+        df, identificador_df, variables_control_continuas,
+        variables_control_categoricas or [],
+        sup_proporcion, nivel_confianza, error_relativo,
+        proporciones_esperadas, umbral_homogeneidad,
+        margen_muestra_extra, semillas_aleatorias
+    )
+    if errs:
+        return ResultadosMuestreo(
+            estado="ERROR", errores=errs,
+            muestra_infinita=None, muestra_finita=None,
+            mejor_semilla=None, resultado_homogeneidad=None,
+            resumen_variables_control=None, df_piloto=None, df_control=None
+        )
+
+    # Sample sizes
+    n_inf, deriv_inf = calcular_tamano_muestra_poblacion_infinita(
+        sup_proporcion, nivel_confianza, error_relativo
+    )
+    N_ids = df.select(identificador_df).distinct().count()
+    n_fin, deriv_fin, n_fin_adj = calcular_tamano_muestra_poblacion_finita(
+        N_ids, sup_proporcion, nivel_confianza, error_relativo, margen_muestra_extra
+    )
+
+    muestra_infinita = {
+        "tamano_muestra_infinita": n_inf * 2,
+        "muestra_minima_infinita": n_inf,
+        "calculo_muestra_infinita": deriv_inf,
+    }
+    muestra_finita = {
+        "tamano_muestra_finita": n_fin * 2,
+        "muestra_minima_finita": n_fin,
+        "muestra_min_extra": n_fin_adj,
+        "calculo_muestra_finita": deriv_fin,
+    }
+
+    # Generate groups + evaluate
+    best, estado_gen, errs_gen, df_piloto, df_control = generar_muestras_y_evaluar(
+        df=df,
+        ident=identificador_df,
+        ind_cont=variables_control_continuas,
+        ind_cat=variables_control_categoricas or [],
+        muestra_minima_extra=n_fin_adj,
+        proportions=proporciones_esperadas,
+        seeds=semillas_aleatorias,
+        p_threshold=umbral_homogeneidad,
+    )
+
+    if estado_gen == "ERROR":
+        errores.extend(errs_gen)
+        return ResultadosMuestreo(
+            estado="ERROR", errores=errores,
+            muestra_infinita=muestra_infinita, muestra_finita=muestra_finita,
+            mejor_semilla=None, resultado_homogeneidad=None,
+            resumen_variables_control=None, df_piloto=None, df_control=None
+        )
+
+    mejor_semilla = best.get("mejor_semilla")
+    res_homog = best.copy()
+    res_homog.pop("ids", None)
+
+    resumen_control = analizar_datos_por_grupo(
+        df_piloto, df_control, variables_control_continuas, variables_control_categoricas or []
+    )
+
+    # Persist outputs
+    if save_outputs:
+        os.makedirs("outputs", exist_ok=True)
+        payload = {
+            "muestra_infinita": muestra_infinita,
+            "muestra_finita": muestra_finita,
+            "resultado_homogeneidad": res_homog,
+            "resumen_variables_control": resumen_control,
+            "semillas": semillas_aleatorias,
+        }
+        with open(f"outputs/resultados_{mejor_semilla}.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4, ensure_ascii=False)
+        if df_piloto is not None:
+            df_piloto.write.mode("overwrite").parquet(f"outputs/df_piloto_{mejor_semilla}.parquet")
+        if df_control is not None:
+            df_control.write.mode("overwrite").parquet(f"outputs/df_control_{mejor_semilla}.parquet")
+
+    return ResultadosMuestreo(
+        estado=estado, errores=errores,
+        muestra_infinita=muestra_infinita, muestra_finita=muestra_finita,
+        mejor_semilla=mejor_semilla, resultado_homogeneidad=res_homog,
+        resumen_variables_control=resumen_control,
+        df_piloto=df_piloto, df_control=df_control
+    )
+
+# === 7) (Optional) Example usage ======================================
+# NOTE: Replace this with your real Spark DataFrame.
+# from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType, StringType
+# data = [
+#     (1, 10.0, 5.0, "A"), (2, 11.0, 5.5, "B"), (3, 9.2, 5.1, "A"),
+#     (4, 10.5, 5.2, "B"), (5, 10.1, 5.4, "A"), (6, 9.9, 5.0, "B"),
+#     (7, 10.3, 5.3, "A"), (8, 10.7, 5.6, "B"), (9, 9.8, 5.2, "A"),
+#     (10, 10.2, 5.1, "B"),
+# ]
+# schema = "id INT, x DOUBLE, y DOUBLE, cat STRING"
+# df_demo = spark.createDataFrame(data, schema=schema)
+#
+# resultados = run_muestreo_homogeneidad(
+#     df=df_demo,
+#     identificador_df="id",
+#     variables_control_continuas=["x", "y"],
+#     variables_control_categoricas=["cat"],
+#     sup_proporcion=0.5,
+#     nivel_confianza=0.95,
+#     error_relativo=0.05,
+#     proporciones_esperadas=(0.5, 0.5),
+#     semillas_aleatorias=[random.randint(0, 10**6) for _ in range(5)],
+#     umbral_homogeneidad=0.05,
+#     margen_muestra_extra=0.1,
+#     save_outputs=False,   # set True to persist parquet/json
+# )
+# logging.info(f"Estado: {resultados.estado}, Mejor semilla: {resultados.mejor_semilla}")
+# logging.info(f"Resumen continuas: {resultados.resumen_variables_control['Variables_Continuas']}")
+# logging.info(f"Resumen categóricas: {resultados.resumen_variables_control['Variables_Categoricas']}")
