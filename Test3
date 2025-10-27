@@ -1,0 +1,673 @@
+# ================================================================
+# 0. Setup básico
+# ================================================================
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, rand
+from math import sqrt, log, ceil
+import json, os, logging, random
+
+spark = SparkSession.builder.getOrCreate()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("muestreo_abtest_minmem")
+
+# ================================================================
+# 1. Inversa de la normal para Z (sin SciPy)
+# ================================================================
+
+def norm_ppf(p: float) -> float:
+    """
+    Aproximación Acklam de la inversa de la CDF normal estándar.
+    p en (0,1). No usa scipy.
+    """
+    if not (0.0 < p < 1.0):
+        raise ValueError("p must be in (0,1)")
+
+    a = [-3.969683028665376e+01,  2.209460984245205e+02,
+         -2.759285104469687e+02,  1.383577518672690e+02,
+         -3.066479806614716e+01,  2.506628277459239e+00]
+    b = [-5.447609879822406e+01,  1.615858368580409e+02,
+         -1.556989798598866e+02,  6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+          4.374664141464968e+00,  2.938163982698783e+00]
+    d = [ 7.784695709041462e-03,  3.224671290700398e-01,
+          2.445134137142996e+00,  3.754408661907416e+00]
+
+    plow  = 0.02425
+    phigh = 1 - plow
+
+    if p < plow:
+        q = sqrt(-2*log(p))
+        return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+               ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    elif p > phigh:
+        q = sqrt(-2*log(1 - p))
+        return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+                 ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    else:
+        q = p - 0.5
+        r = q*q
+        num = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q
+        den = (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
+        return num / den
+
+def z_from_nc(nc: float) -> float:
+    """
+    Z para nivel de confianza bilateral nc.
+    Ej: nc=0.95 -> ~1.96
+    """
+    p = 1 - (1 - nc)/2.0
+    return norm_ppf(p)
+
+# ================================================================
+# 2. Tamaño de muestra
+# ================================================================
+
+def calcular_tamano_muestra_poblacion_infinita(p: float, nc: float, e_rel: float):
+    """
+    n = (Z^2 * p * q)/e^2
+    Retorna n_min_por_grupo, desc
+    """
+    Z = z_from_nc(nc)
+    q = 1 - p
+    e = e_rel
+    n = (Z**2 * p * q) / (e**2)
+    n_int = int(ceil(n))
+    desc = f"n=(Z^2*p*q)/e^2 con Z={round(Z,4)}, p={p}, q={q}, e={e}"
+    return n_int, desc
+
+def calcular_tamano_muestra_poblacion_finita(
+    N_total_ids: int,
+    p: float,
+    nc: float,
+    e_rel: float,
+    margen_extra: float
+):
+    """
+    n_f = (N * n_inf)/(n_inf + N - 1), luego ajusta margen_extra
+    """
+    n_inf, desc_inf = calcular_tamano_muestra_poblacion_infinita(p, nc, e_rel)
+    N = max(int(N_total_ids), 1)
+    n_fin = int(ceil((N * n_inf) / (n_inf + N - 1)))
+    n_fin_adj = int(ceil(n_fin * (1 + margen_extra)))
+
+    desc = (
+        desc_inf
+        + f"; ajuste finito N={N} => n_fin={n_fin}; margen_extra={margen_extra} => n_fin_adj={n_fin_adj}"
+    )
+    return n_fin, desc, n_fin_adj
+
+# ================================================================
+# 3. Validación y selección de grupos sin guardar IDs
+# ================================================================
+
+def validar_parametros(
+    df: DataFrame,
+    ident_col: str,
+    vars_continuas: list,
+    vars_categoricas: list,
+    p: float,
+    nc: float,
+    e_rel: float,
+    proporciones: tuple,
+    umbral_homogeneidad: float,
+    margen_extra: float,
+    semillas: list,
+):
+    errores = []
+
+    if df is None:
+        errores.append("df no puede ser None")
+
+    if ident_col not in df.columns:
+        errores.append(f"La columna '{ident_col}' no existe en df")
+
+    if not isinstance(vars_continuas, list):
+        errores.append("vars_continuas debe ser lista")
+    if vars_categoricas is not None and not isinstance(vars_categoricas, list):
+        errores.append("vars_categoricas debe ser lista o []")
+
+    def _chk_num01(nombre, val):
+        if not isinstance(val, (int, float)):
+            errores.append(f"{nombre} debe ser numérico")
+        elif not (0 <= float(val) <= 1):
+            errores.append(f"{nombre} debe estar en [0,1]. Valor: {val}")
+
+    _chk_num01("p", p)
+    _chk_num01("nc", nc)
+    _chk_num01("e_rel", e_rel)
+    _chk_num01("umbral_homogeneidad", umbral_homogeneidad)
+    _chk_num01("margen_extra", margen_extra)
+
+    if not isinstance(proporciones, tuple) or len(proporciones) != 2:
+        errores.append("proporciones debe ser tupla (piloto, control)")
+    else:
+        s = proporciones[0] + proporciones[1]
+        if abs(s - 1.0) > 1e-6:
+            errores.append(f"La suma de proporciones debe ser 1. Suma actual={s}")
+
+    if not isinstance(semillas, list) or len(semillas) == 0:
+        errores.append("semillas debe ser lista con al menos 1 entero")
+    else:
+        for sd in semillas:
+            if not isinstance(sd, int) or sd < 0:
+                errores.append("todas las semillas deben ser enteros >= 0")
+                break
+
+    return errores
+
+
+def _subsets_por_semilla(
+    df: DataFrame,
+    ident_col: str,
+    proporciones: tuple,
+    semilla: int,
+    minimo_por_grupo: int,
+):
+    """
+    Devuelve (df_piloto, df_control, resumen_grupos)
+    SIN devolver ids como listas (para ahorrar memoria del driver).
+    """
+    ids_df = df.select(ident_col).where(col(ident_col).isNotNull()).distinct()
+    total_ids = ids_df.count()
+
+    n_piloto  = int(proporciones[0] * total_ids)
+    n_control = int(proporciones[1] * total_ids)
+
+    if total_ids < minimo_por_grupo:
+        raise ValueError(f"IDs únicos insuficientes ({total_ids}) para mínimo {minimo_por_grupo}")
+    if n_piloto < minimo_por_grupo or n_control < minimo_por_grupo:
+        raise ValueError(f"Piloto({n_piloto})/Control({n_control}) < mínimo {minimo_por_grupo}")
+    if n_piloto + n_control > total_ids:
+        raise ValueError("n_piloto + n_control excede total_ids")
+
+    # Elegir piloto
+    piloto_ids_df = (
+        ids_df
+        .withColumn("_r", rand(seed=semilla))
+        .orderBy("_r")
+        .limit(n_piloto)
+        .drop("_r")
+    )
+
+    # Resto para control
+    control_ids_df = (
+        ids_df.join(piloto_ids_df, on=ident_col, how="left_anti")
+             .withColumn("_r", rand(seed=semilla+1))
+             .orderBy("_r")
+             .limit(n_control)
+             .drop("_r")
+    )
+
+    # Unir para obtener subsets
+    df_piloto = df.join(piloto_ids_df, on=ident_col, how="inner")
+    df_control = df.join(control_ids_df, on=ident_col, how="inner")
+
+    resumen_grupos = {
+        "total_ids": total_ids,
+        "piloto":  {"n": n_piloto,  "prop": proporciones[0]},
+        "control": {"n": n_control, "prop": proporciones[1]},
+    }
+
+    return df_piloto, df_control, resumen_grupos
+
+# ================================================================
+# 4. Métricas de homogeneidad con etiquetas de ruptura
+#    IMPORTANTE: Todo se calcula como agregados Spark.
+# ================================================================
+
+def _metricas_continuas(
+    df_piloto: DataFrame,
+    df_control: DataFrame,
+    vars_continuas: list,
+    umbral_homogeneidad: float
+):
+    """
+    Para cada var continua:
+      - mean, var_pop, median (percentile_approx)
+      - diff_% entre grupos
+      - quién rompe el umbral
+    """
+    resultados = {}
+    homog_ok = True
+
+    for v in vars_continuas:
+        # agregados del piloto
+        agg1 = df_piloto.agg(
+            F.count(F.col(v)).alias("n"),
+            F.mean(F.col(v)).alias("mean"),
+            F.var_pop(F.col(v)).alias("var"),
+            F.expr(f"percentile_approx({v}, 0.5)").alias("p50")
+        ).collect()[0]
+
+        # agregados del control
+        agg2 = df_control.agg(
+            F.count(F.col(v)).alias("n"),
+            F.mean(F.col(v)).alias("mean"),
+            F.var_pop(F.col(v)).alias("var"),
+            F.expr(f"percentile_approx({v}, 0.5)").alias("p50")
+        ).collect()[0]
+
+        mean1, mean2 = agg1["mean"], agg2["mean"]
+        var1, var2   = agg1["var"],  agg2["var"]
+        med1, med2   = agg1["p50"],  agg2["p50"]
+
+        def rel_diff(a, b):
+            if a is None or b is None or a == 0:
+                return None
+            return abs(a - b) / abs(a)
+
+        diff_mean_pct   = rel_diff(mean1, mean2)
+        diff_var_pct    = rel_diff(var1, var2)
+        diff_median_pct = rel_diff(med1, med2)
+
+        # Registrar cuáles rompieron
+        rompe = []
+        for name, val in [
+            ("mean", diff_mean_pct),
+            ("var", diff_var_pct),
+            ("median", diff_median_pct),
+        ]:
+            if val is not None and val > umbral_homogeneidad:
+                rompe.append(name)
+
+        if len(rompe) > 0:
+            homog_ok = False
+
+        resultados[v] = {
+            "n_piloto": agg1["n"],
+            "n_control": agg2["n"],
+            "mean_piloto": mean1,
+            "mean_control": mean2,
+            "var_piloto": var1,
+            "var_control": var2,
+            "median_piloto": med1,
+            "median_control": med2,
+            "diff_mean_pct": diff_mean_pct,
+            "diff_var_pct": diff_var_pct,
+            "diff_median_pct": diff_median_pct,
+            "rompe_umbral": rompe,  # ej ['var', 'median']
+        }
+
+    return resultados, homog_ok
+
+
+def _metricas_categoricas(
+    df_piloto: DataFrame,
+    df_control: DataFrame,
+    vars_categoricas: list,
+    umbral_homogeneidad: float
+):
+    """
+    Para cada var categórica:
+      - Calculamos % por categoría en piloto y control,
+      - diff_pct = |pct1 - pct2|
+      - tomamos la diff_pct máxima,
+      - marcamos si rompe o no el umbral.
+    """
+    resultados = {}
+    homog_ok = True
+
+    for v in vars_categoricas:
+        total1 = df_piloto.count()
+        total2 = df_control.count()
+
+        freq1 = (
+            df_piloto.groupBy(v)
+                     .count()
+                     .withColumnRenamed("count", "count1")
+        )
+        freq2 = (
+            df_control.groupBy(v)
+                      .count()
+                      .withColumnRenamed("count", "count2")
+        )
+
+        cats_df = freq1.select(v).union(freq2.select(v)).distinct()
+
+        joined = (
+            cats_df
+            .join(freq1, on=v, how="left")
+            .join(freq2, on=v, how="left")
+            .fillna(0, subset=["count1", "count2"])
+            .withColumn("pct1", F.col("count1") / F.lit(total1))
+            .withColumn("pct2", F.col("count2") / F.lit(total2))
+            .withColumn("diff_pct", F.abs(F.col("pct1") - F.col("pct2")))
+        )
+
+        rows = joined.collect()  # pequeño: una fila por categoría distinta
+        detalle_cats = []
+        max_diff = 0.0
+
+        for r in rows:
+            cat_val = r[v]
+            c1 = r["count1"]
+            c2 = r["count2"]
+            pct1 = float(r["pct1"]) if r["pct1"] is not None else 0.0
+            pct2 = float(r["pct2"]) if r["pct2"] is not None else 0.0
+            dff  = float(r["diff_pct"]) if r["diff_pct"] is not None else 0.0
+
+            if dff > max_diff:
+                max_diff = dff
+
+            detalle_cats.append({
+                "categoria": cat_val,
+                "count_piloto": c1,
+                "count_control": c2,
+                "pct_piloto": pct1,
+                "pct_control": pct2,
+                "diff_pct": dff,
+            })
+
+        rompe = (max_diff > umbral_homogeneidad)
+        if rompe:
+            homog_ok = False
+
+        resultados[v] = {
+            "total_piloto": total1,
+            "total_control": total2,
+            "max_diff_pct": max_diff,
+            "rompe_umbral": rompe,
+            "categorias": detalle_cats
+        }
+
+    return resultados, homog_ok
+
+
+def evaluar_homogeneidad(
+    df_piloto: DataFrame,
+    df_control: DataFrame,
+    vars_continuas: list,
+    vars_categoricas: list,
+    umbral_homogeneidad: float
+):
+    """
+    Devuelve:
+      resultados (dict con detalles),
+      es_homogeneo (bool).
+    """
+    resultados = {}
+
+    cont_res, cont_ok = _metricas_continuas(
+        df_piloto, df_control, vars_continuas, umbral_homogeneidad
+    )
+    resultados["continuas"] = cont_res
+
+    cat_res, cat_ok = _metricas_categoricas(
+        df_piloto, df_control, vars_categoricas, umbral_homogeneidad
+    )
+    resultados["categoricas"] = cat_res
+
+    es_homogeneo = cont_ok and cat_ok
+    return resultados, es_homogeneo
+
+
+def _score_para_eleccion(resultados: dict):
+    """
+    Score pequeño = mejor balance.
+    Sumamos:
+      - diffs relativas de continuas
+      - max_diff_pct categóricas
+    """
+    score = 0.0
+
+    # continuas
+    for varname, met in resultados.get("continuas", {}).items():
+        for k in ["diff_mean_pct", "diff_var_pct", "diff_median_pct"]:
+            val = met.get(k)
+            if val is not None:
+                score += float(val)
+
+    # categóricas
+    for varname, met in resultados.get("categoricas", {}).items():
+        m = met.get("max_diff_pct")
+        if m is not None:
+            score += float(m)
+
+    return score
+
+# ================================================================
+# 5. Orquestador principal MIN-MEM
+#    - No guardamos IDs
+#    - Guardamos solo df_piloto y df_control del mejor seed
+#    - Guardamos resúmenes compactos
+# ================================================================
+
+def run_muestreo_homogeneidad(
+    df: DataFrame,
+    identificador_df: str,
+    variables_control_continuas: list,
+    variables_control_categoricas: list,
+    sup_proporcion: float,
+    nivel_confianza: float,
+    error_relativo: float,
+    proporciones_esperadas: tuple,
+    semillas_aleatorias: list,
+    umbral_homogeneidad: float,
+    margen_muestra_extra: float,
+    save_outputs: bool = False,
+):
+    """
+    Retorna dict con:
+      estado, errores,
+      mejor_semilla,
+      info_muestra_infinita, info_muestra_finita,
+      resumen_variables_control,
+      resultados_homogeneidad_detalle,
+      df_piloto, df_control
+    """
+
+    resultado_global = {
+        "estado": "OK",
+        "errores": [],
+        "mejor_semilla": None,
+        "info_muestra_infinita": None,
+        "info_muestra_finita": None,
+        "resumen_variables_control": None,
+        "resultados_homogeneidad_detalle": None,
+        "df_piloto": None,
+        "df_control": None,
+    }
+
+    # 1. Validación
+    errs = validar_parametros(
+        df,
+        identificador_df,
+        variables_control_continuas,
+        variables_control_categoricas or [],
+        sup_proporcion,
+        nivel_confianza,
+        error_relativo,
+        proporciones_esperadas,
+        umbral_homogeneidad,
+        margen_muestra_extra,
+        semillas_aleatorias
+    )
+
+    if errs:
+        resultado_global["estado"] = "ERROR"
+        resultado_global["errores"] = errs
+        return resultado_global
+
+    # 2. Tamaños de muestra
+    total_ids = (
+        df.select(identificador_df)
+          .where(col(identificador_df).isNotNull())
+          .distinct()
+          .count()
+    )
+
+    n_inf, desc_inf = calcular_tamano_muestra_poblacion_infinita(
+        sup_proporcion, nivel_confianza, error_relativo
+    )
+    n_fin, desc_fin, n_fin_adj = calcular_tamano_muestra_poblacion_finita(
+        total_ids, sup_proporcion, nivel_confianza, error_relativo, margen_muestra_extra
+    )
+
+    resultado_global["info_muestra_infinita"] = {
+        "tamano_muestra_infinita_total": n_inf * 2,
+        "muestra_minima_infinita_por_grupo": n_inf,
+        "detalle_calculo_infinita": desc_inf,
+    }
+
+    resultado_global["info_muestra_finita"] = {
+        "tamano_muestra_finita_total": n_fin * 2,
+        "muestra_minima_finita_por_grupo": n_fin,
+        "muestra_minima_con_margen": n_fin_adj,
+        "detalle_calculo_finita": desc_fin,
+    }
+
+    # 3. Iteramos semillas y nos quedamos con el mejor grupo
+    mejor_seed = None
+    mejor_score = None
+    mejor_resultados = None
+    mejor_resumen_control = None
+    mejor_df_piloto = None
+    mejor_df_control = None
+
+    for sd in semillas_aleatorias:
+        try:
+            # generar subsets directo (sin guardar IDs en listas finales)
+            df_piloto, df_control, _resumen_grupos = _subsets_por_semilla(
+                df=df,
+                ident_col=identificador_df,
+                proporciones=proporciones_esperadas,
+                semilla=sd,
+                minimo_por_grupo=n_fin_adj
+            )
+
+            # evaluar homogeneidad
+            resultados_h, es_homogeneo = evaluar_homogeneidad(
+                df_piloto=df_piloto,
+                df_control=df_control,
+                vars_continuas=variables_control_continuas,
+                vars_categoricas=variables_control_categoricas or [],
+                umbral_homogeneidad=umbral_homogeneidad
+            )
+
+            # score bajo = grupos más parecidos
+            score = _score_para_eleccion(resultados_h)
+
+            # si no es homogéneo bajo el umbral, penalizamos brutalmente
+            if not es_homogeneo:
+                score += 9999.0
+
+            # resumen compacto legible para reporte
+            resumen_control = {
+                "continuas": [],
+                "categoricas": []
+            }
+
+            for varname, met in resultados_h["continuas"].items():
+                resumen_control["continuas"].append({
+                    "var": varname,
+                    "mean_piloto": met["mean_piloto"],
+                    "mean_control": met["mean_control"],
+                    "median_piloto": met["median_piloto"],
+                    "median_control": met["median_control"],
+                    "rompe_umbral": met["rompe_umbral"],
+                })
+
+            for varname, met in resultados_h["categoricas"].items():
+                resumen_control["categoricas"].append({
+                    "var": varname,
+                    "max_diff_pct": met["max_diff_pct"],
+                    "rompe_umbral": met["rompe_umbral"],
+                    "categorias": met["categorias"],  # lista pequeña
+                })
+
+            # actualizar ganador
+            if (mejor_score is None) or (score < mejor_score):
+                mejor_score = score
+                mejor_seed = sd
+                mejor_resultados = resultados_h
+                mejor_resumen_control = resumen_control
+                mejor_df_piloto = df_piloto
+                mejor_df_control = df_control
+
+        except Exception as e:
+            resultado_global["estado"] = "ERROR"
+            resultado_global["errores"].append(f"Semilla {sd} falló: {str(e)}")
+            # seguimos probando con las otras semillas
+
+    # Si no logramos ningún candidato usable
+    if mejor_seed is None:
+        if resultado_global["estado"] != "ERROR":
+            resultado_global["estado"] = "ERROR"
+            resultado_global["errores"].append("No se pudo generar ningún grupo válido.")
+        return resultado_global
+
+    # 4. Guardamos solo el mejor (no guardamos IDs)
+    resultado_global["mejor_semilla"] = mejor_seed
+    resultado_global["resumen_variables_control"] = mejor_resumen_control
+    resultado_global["resultados_homogeneidad_detalle"] = mejor_resultados
+    resultado_global["df_piloto"] = mejor_df_piloto
+    resultado_global["df_control"] = mejor_df_control
+
+    # 5. Salida opcional a disco
+    if save_outputs:
+        os.makedirs("outputs", exist_ok=True)
+
+        resumen_para_json = {
+            "mejor_semilla": mejor_seed,
+            "info_muestra_infinita": resultado_global["info_muestra_infinita"],
+            "info_muestra_finita": resultado_global["info_muestra_finita"],
+            "resumen_variables_control": mejor_resumen_control,
+            "resultados_homogeneidad_detalle": mejor_resultados,
+            "umbral_homogeneidad": umbral_homogeneidad,
+            "semillas_probadas": semillas_aleatorias,
+        }
+
+        with open(f"outputs/resultados_{mejor_seed}.json", "w", encoding="utf-8") as f:
+            json.dump(resumen_para_json, f, indent=4, ensure_ascii=False)
+
+        mejor_df_piloto.write.mode("overwrite").parquet(f"outputs/df_piloto_{mejor_seed}.parquet")
+        mejor_df_control.write.mode("overwrite").parquet(f"outputs/df_control_{mejor_seed}.parquet")
+
+    return resultado_global
+
+
+# ================================================================
+# 6. Ejemplo de uso (puedes comentar esto en producción)
+# ================================================================
+
+# from pyspark.sql import Row
+# df_base = spark.createDataFrame([
+#     Row(user_id=1, monto=10.0, edad=25, genero="M"),
+#     Row(user_id=2, monto=11.0, edad=25, genero="F"),
+#     Row(user_id=3, monto=10.5, edad=24, genero="M"),
+#     Row(user_id=4, monto=9.8,  edad=24, genero="F"),
+#     Row(user_id=5, monto=10.3, edad=26, genero="M"),
+#     Row(user_id=6, monto=10.4, edad=27, genero="M"),
+#     Row(user_id=7, monto=10.2, edad=27, genero="F"),
+#     Row(user_id=8, monto=10.1, edad=25, genero="M"),
+#     Row(user_id=9, monto=10.7, edad=26, genero="F"),
+#     Row(user_id=10,monto=10.9, edad=26, genero="M"),
+# ])
+
+# resultado = run_muestreo_homogeneidad(
+#     df=df_base,
+#     identificador_df="user_id",
+#     variables_control_continuas=["monto", "edad"],
+#     variables_control_categoricas=["genero"],
+#     sup_proporcion=0.5,
+#     nivel_confianza=0.95,
+#     error_relativo=0.05,
+#     proporciones_esperadas=(0.5, 0.5),
+#     semillas_aleatorias=[random.randint(0, 10**6) for _ in range(5)],
+#     umbral_homogeneidad=0.05,
+#     margen_muestra_extra=0.1,
+#     save_outputs=False
+# )
+
+# logger.info(f"Estado final: {resultado['estado']}")
+# logger.info(f"Mejor semilla: {resultado['mejor_semilla']}")
+# logger.info(f"Errores: {resultado['errores']}")
+# logger.info(f"Resumen control: {resultado['resumen_variables_control']}")
