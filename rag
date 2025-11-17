@@ -1,0 +1,435 @@
+Presentación: ¿Qué es RAG? (Retrieval-Augmented Generation)
+🧠 Diapositiva 1: ¿Qué es RAG?
+
+Retrieval-Augmented Generation (RAG) combina un modelo de lenguaje (LLM) con un sistema de recuperación de información.
+
+El modelo genera respuestas basadas no solo en lo que "sabe", sino en lo que recupera de documentos externos.
+
+Usa bases de datos, PDFs, páginas web, manuales internos, etc.
+
+Responde basado en hechos y documentos reales.
+
+📍 Diapositiva 2: ¿Por qué se creó RAG?
+
+Los modelos de lenguaje tradicionales tienen limitaciones:
+
+Información desactualizada (por ejemplo, solo hasta 2023).
+
+No conocen datos privados o específicos de una empresa.
+
+Tienden a alucinar cuando no tienen datos suficientes.
+
+RAG soluciona esto:
+
+Permite acceder a datos actualizados y específicos.
+
+Evita alucinaciones mediante uso de fuentes confiables.
+
+Le da contexto personalizado al modelo antes de generar respuestas.
+
+⚙️ Diapositiva 3: Arquitectura general de RAG
+
+FLUJO BÁSICO:
+
+Usuario hace una pregunta.
+
+El sistema convierte la pregunta en un vector (embedding).
+
+Busca los documentos con contenido similar en un vector store.
+
+Devuelve los fragmentos relevantes al LLM.
+
+El LLM responde usando esos fragmentos como contexto.
+
+Componentes claves:
+
+LLM (ChatGPT, LLaMA, etc.)
+
+Generador de embeddings
+
+Vector Store (FAISS, Chroma, Qdrant)
+
+Indexador de documentos
+
+Motor de búsqueda semántica
+
+🧱 Diapositiva 4: ¿Cómo funciona RAG? (paso a paso técnico)
+1. Ingesta de documentos
+
+Se recolectan archivos (PDF, DOCX, HTML, etc.)
+
+Se extrae texto y se limpia (quitar líneas repetitivas, basura, etc.)
+
+2. Chunking
+
+Se divide el texto en bloques pequeños (chuncks), típicamente:
+
+200 – 1000 palabras
+
+Cada chunk debe tener sentido propio
+
+3. Embeddings
+
+Cada chunk se convierte en un vector numérico (embedding)
+
+Representa el significado del texto
+
+Textos similares → vectores cercanos
+
+4. Vector Store
+
+Se almacenan embeddings + texto original + metadatos
+
+Ej: FAISS, Chroma, Milvus
+
+5. Búsqueda semántica
+
+Al llegar una pregunta:
+
+Convertir la pregunta a embedding
+
+Buscar los chunks más similares
+
+Pasar esos chunks junto con la pregunta al LLM
+
+🧰 Diapositiva 5: Herramientas para implementar RAG
+
+Lenguaje de programación: Python
+
+Librerías clave:
+
+🔹 LangChain
+
+🔹 LlamaIndex
+
+🔹 Hugging Face (Transformers)
+
+🔹 OpenAI SDK o Llama SDK
+
+Modelos de embeddings:
+
+text-embedding-3-small (OpenAI)
+
+bge-large
+
+sentence-transformers
+
+Vector Stores:
+
+FAISS (local)
+
+Chroma (local o remoto)
+
+Qdrant / Milvus (servicio en la nube)
+
+Framework web para APIs o UI:
+
+FastAPI
+
+Streamlit
+
+Flask
+
+💡 Diapositiva 6: Casos de uso reales con RAG
+
+Chat con documentación interna
+
+Manuales técnicos
+
+Políticas de empresa
+
+Documentación de API
+
+Soporte al cliente automatizado
+
+Respuesta a FAQs
+
+Políticas de devoluciones
+
+Análisis de documentos legales / contratos
+
+Extraer cláusulas específicas según consulta
+
+Asistente inteligente para equipos internos
+
+Reglas del negocio
+
+Normativa interna
+
+Búsqueda avanzada
+
+Ejemplo: "Encuentra dónde se menciona la política de préstamos del cliente VIP".
+
+📋 Diapositiva 7: Ventajas de RAG
+
+Respuestas más precisas, basadas en datos reales.
+
+Mantiene al modelo actualizado sin necesidad de reentrenamiento.
+
+Reducida alucinación si el pipeline está bien diseñado.
+
+Permite buscar y citar fragmentos específicos.
+
+Fácil de iterar y ajustar sin cambiar el modelo.
+
+🔐 Diapositiva 8: Desafíos y consideraciones
+Técnicos:
+
+Elegir el tamaño ideal de chunks
+
+Ajustar los parámetros de similaridad en la búsqueda
+
+Límite de tokens del contexto del LLM
+
+Seguridad:
+
+Privacidad de datos privados (evitar fugas)
+
+Control de acceso a ciertos documentos
+
+Uso de modelos locales vs APIs externas
+
+📈 Diapositiva 9: Checklist para crear tu propio RAG
+
+Definir caso de uso concreto
+
+Recolectar documentos relevantes
+
+Limpiar texto y definir estrategia de chunking
+
+Elegir generador de embeddings y vector store
+
+Crear el pipeline pregunta → búsqueda → generación
+
+Crear interfaz/API para acceder al sistema
+
+Evaluar con casos reales
+
+Ajustar y mejorar con feedback
+
+🧭 Diapositiva 10: Conclusión
+
+RAG permite enriquecer los modelos de lenguaje con datos específicos, dinámicos y privados.
+Es ideal para automatizar consultas complejas, construir asistentes inteligentes y evitar alucinaciones, todo basado en conocimiento verificable y accesible.
+
+RAG es el puente entre lo que un modelo sabe y lo que tú necesitas que responda.
+
+
+
+0. Preparación fuera del notebook (solo una vez)
+
+En tu máquina:
+
+Instalar Ollama (según tu SO, desde la web oficial).
+
+Descargar un modelo local, por ejemplo:
+
+ollama pull llama3
+
+
+Asegúrate de que el servidor de Ollama esté corriendo (normalmente es automático al usar ollama).
+
+1. Instalación de dependencias (celda 1 del notebook)
+%pip install sentence-transformers chromadb requests
+
+2. Imports y configuración (celda 2)
+
+Comentarios en inglés y uso de logging.
+
+import os
+import glob
+import logging
+from typing import List, Dict
+
+import requests
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+3. Cargar archivos .md y crear chunks (celda 3)
+
+Carpeta con tus .md, por ejemplo: data_md/ al lado del notebook.
+
+DATA_DIR = "data_md"  # Folder with your .md files
+
+def load_markdown_files(directory: str) -> List[Dict]:
+    """Load all .md files from a directory."""
+    docs = []
+    for path in glob.glob(os.path.join(directory, "*.md")):
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        docs.append({"path": path, "text": text})
+    logger.info("Loaded %d markdown files", len(docs))
+    return docs
+
+def chunk_text(text: str, max_chars: int = 800, overlap: int = 100) -> List[str]:
+    """Chunk text into overlapping windows of max_chars."""
+    chunks = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = min(start + max_chars, length)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return chunks
+
+4. Embeddings + Vector Store local con Chroma (celda 4)
+
+Usamos un modelo ligero de sentence-transformers y Chroma con persistencia local.
+
+# Load embedding model (local)
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# Initialize Chroma vector store (local folder ./chroma_db)
+client = chromadb.Client(
+    Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory="./chroma_db"
+    )
+)
+
+collection = client.get_or_create_collection(
+    name="md_rag_collection_local",
+    metadata={"description": "Markdown docs for local RAG demo"}
+)
+
+def index_documents():
+    """Load markdown files, chunk them, embed and index them in Chroma."""
+    docs = load_markdown_files(DATA_DIR)
+    ids = []
+    texts = []
+    metadatas = []
+
+    idx = 0
+    for doc in docs:
+        chunks = chunk_text(doc["text"])
+        for chunk in chunks:
+            ids.append(f"doc_{idx}")
+            texts.append(chunk)
+            metadatas.append({"source": doc["path"]})
+            idx += 1
+
+    logger.info("Total chunks to index: %d", len(texts))
+
+    embeddings = embedding_model.encode(texts, show_progress_bar=True).tolist()
+
+    collection.add(
+        ids=ids,
+        documents=texts,
+        metadatas=metadatas,
+        embeddings=embeddings
+    )
+    client.persist()
+    logger.info("Indexing complete.")
+
+# Run this once (or when you change the .md files)
+index_documents()
+
+5. Recuperación de contexto (celda 5)
+
+Función para buscar los chunks relevantes.
+
+def retrieve_context(query: str, top_k: int = 4) -> List[Dict]:
+    """Retrieve top_k most relevant chunks for a query."""
+    query_embedding = embedding_model.encode([query]).tolist()[0]
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k
+    )
+    contexts = []
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        contexts.append({"text": doc, "source": meta["source"]})
+    return contexts
+
+def build_prompt(query: str, contexts: List[Dict]) -> str:
+    """Build a prompt with retrieved contexts."""
+    context_text = "\n\n---\n\n".join(
+        [f"Source: {c['source']}\n{c['text']}" for c in contexts]
+    )
+    prompt = f"""
+You are an assistant that must answer strictly based on the provided context.
+
+Context:
+{context_text}
+
+Question:
+{query}
+
+Instructions:
+- Use only the information from the context.
+- If the answer is not in the context, say that the information is not available in the provided documents.
+- Answer concisely.
+"""
+    return prompt
+
+6. Llamar al LLM local vía Ollama (celda 6)
+
+Usamos la API HTTP de Ollama (http://localhost:11434/api/generate) con un modelo local, por ejemplo llama3.
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3"  # Change if you use another local model
+
+def call_ollama(prompt: str) -> str:
+    """Call a local LLM via Ollama HTTP API."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+    # According to Ollama API, 'response' contains the generated text
+    return data.get("response", "").strip()
+
+7. Función RAG completa (celda 7)
+
+Une recuperación + prompt + LLM local.
+
+def ask_rag_local(query: str, top_k: int = 4) -> str:
+    """RAG-style question answering using local embeddings + local LLM."""
+    contexts = retrieve_context(query, top_k=top_k)
+    if not contexts:
+        return "No context found for this query."
+
+    prompt = build_prompt(query, contexts)
+    answer = call_ollama(prompt)
+    return answer
+
+8. Probar el sistema RAG local (celda 8)
+
+Aquí ya puedes hacer preguntas sobre el contenido de tus .md.
+
+question = "¿Qué explica la introducción del proyecto?"  # Cambia según tu contenido
+answer = ask_rag_local(question)
+answer
+
+
+Puedes ejecutar varias veces esta celda cambiando la pregunta.
+
+9. Resumen rápido de lo que hace este notebook
+
+Carga todos los .md de data_md/.
+
+Los divide en chunks con solapamiento.
+
+Genera embeddings locales con sentence-transformers.
+
+Indexa en ChromaDB local.
+
+Para cada pregunta:
+
+Busca los chunks más relevantes.
+
+Construye un prompt con esos chunks.
+
+Llama a un modelo local en Ollama (llama3 u otro).
+
+Devuelve una respuesta basada solo en tus documentos.
+
